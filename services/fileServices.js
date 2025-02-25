@@ -34,19 +34,40 @@ async function getNewFiles() {
 async function splitFile(filename) {
   return new Promise((resolve, reject) => {
     const inputFilePath = path.join(INPUT_FOLDER, filename);
-    const outputFilePath = path.join(OUTPUT_FOLDER, filename);
+    const outputFileName = path.parse(filename).name; // Get file name without extension
+    const fileExtension = path.extname(filename); // Get file extension
+    const outputPrefix = path.join(OUTPUT_FOLDER, `${outputFileName}_`); // Prefix for chunks
 
     fs.stat(inputFilePath, (err, stats) => {
       if (err) return reject(err);
       if (stats.size <= 10 * 1024 * 1024)
         return reject("File is too small to split.");
 
-      const command = `split -b 10m "${inputFilePath}" "${outputFilePath}_"`;
-      exec(command, (error) => {
-        if (error) return reject(error);
-        console.log(`File ${filename} split successfully.`);
+      // Read file and split into chunks
+      const readStream = fs.createReadStream(inputFilePath, {
+        highWaterMark: 10 * 1024 * 1024,
+      });
+      let index = 0;
+
+      readStream.on("data", (chunk) => {
+        const chunkFileName = `${outputPrefix}${String(index).padStart(
+          3,
+          "0"
+        )}${fileExtension}`;
+        fs.writeFileSync(chunkFileName, chunk);
+        index++;
+      });
+
+      readStream.on("end", () => {
+        console.log(
+          `File ${filename} split successfully into ${index} chunks.`
+        );
         fileModel.markAsProcessed(filename);
         resolve();
+      });
+
+      readStream.on("error", (error) => {
+        reject(error);
       });
     });
   });
@@ -54,20 +75,32 @@ async function splitFile(filename) {
 
 async function verifyChunks(filename) {
   return new Promise((resolve, reject) => {
-    const inputFilePath = path.join(INPUT_FOLDER, filename);
-    const outputFilePath = path.join(OUTPUT_FOLDER, filename);
+    const outputFileName = path.parse(filename).name; // Get file name without extension
+    const fileExtension = path.extname(filename); // Get file extension
+    const chunkPattern = new RegExp(
+      `^${outputFileName}_\\d{3}\\${fileExtension}$`
+    ); // Matches "file_000.pdf"
 
     // Find all split chunks
     const chunkFiles = fs
       .readdirSync(OUTPUT_FOLDER)
-      .filter((f) => f.startsWith(filename + "_"))
+      .filter((f) => chunkPattern.test(f)) // Filter files matching the pattern
       .sort(); // Ensure correct order
 
     if (chunkFiles.length === 0) {
-      return reject(`No chunks found for ${filename}`);
+      return reject(` No chunks found for ${filename}`);
     }
 
-    const reconstructedFile = `${outputFilePath}_reconstructed`;
+    console.log(
+      ` Found ${chunkFiles.length} chunks for ${filename}:`,
+      chunkFiles
+    );
+
+    const inputFilePath = path.join(INPUT_FOLDER, filename);
+    const reconstructedFile = path.join(
+      OUTPUT_FOLDER,
+      `${outputFileName}_reconstructed${fileExtension}`
+    );
     const writeStream = fs.createWriteStream(reconstructedFile);
 
     chunkFiles.forEach((chunk) => {

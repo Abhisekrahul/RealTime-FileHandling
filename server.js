@@ -5,6 +5,10 @@ const cronJob = require("./config/cronjob");
 const app = express();
 app.use(express.json());
 
+app.get("/", (req, res) => {
+  res.send("Welcome to the File Processing API!");
+});
+
 // Routes
 app.use("/api/files", fileRoutes);
 
