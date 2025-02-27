@@ -1,8 +1,7 @@
 const fs = require("fs");
-const { exec } = require("child_process");
 const path = require("path");
 const crypto = require("crypto");
-const fileModel = require("../models/fileModels");
+const { PDFDocument } = require("pdf-lib");
 
 const INPUT_FOLDER = path.join(__dirname, "../input");
 const OUTPUT_FOLDER = path.join(__dirname, "../output");
@@ -11,131 +10,103 @@ const OUTPUT_FOLDER = path.join(__dirname, "../output");
 function ensureFoldersExist() {
   if (!fs.existsSync(INPUT_FOLDER)) {
     fs.mkdirSync(INPUT_FOLDER, { recursive: true });
-    console.log("Created input folder.");
+    console.log("📂 Created input folder.");
   }
   if (!fs.existsSync(OUTPUT_FOLDER)) {
     fs.mkdirSync(OUTPUT_FOLDER, { recursive: true });
-    console.log("Created output folder.");
+    console.log("📂 Created output folder.");
   }
 }
 
-ensureFoldersExist(); // Call this function when the service starts
+ensureFoldersExist();
 
-async function getNewFiles() {
-  return new Promise((resolve, reject) => {
-    fs.readdir(INPUT_FOLDER, (err, files) => {
-      if (err) return reject(err);
-      const newFiles = files.filter((file) => !fileModel.isProcessed(file));
-      resolve(newFiles);
-    });
-  });
+// Function to check if a file exists
+function fileExists(filePath) {
+  return fs.existsSync(filePath);
 }
 
-async function splitFile(filename) {
-  return new Promise((resolve, reject) => {
-    const inputFilePath = path.join(INPUT_FOLDER, filename);
-    const outputFileName = path.parse(filename).name; // Get file name without extension
-    const fileExtension = path.extname(filename); // Get file extension
-    const outputPrefix = path.join(OUTPUT_FOLDER, `${outputFileName}_`); // Prefix for chunks
+// ✅ Split PDF into multiple parts
+async function splitPDF(inputFileName, outputFolder) {
+  try {
+    const inputFilePath = path.join(INPUT_FOLDER, inputFileName);
 
-    fs.stat(inputFilePath, (err, stats) => {
-      if (err) return reject(err);
-      if (stats.size <= 10 * 1024 * 1024)
-        return reject("File is too small to split.");
-
-      // Read file and split into chunks
-      const readStream = fs.createReadStream(inputFilePath, {
-        highWaterMark: 10 * 1024 * 1024,
-      });
-      let index = 0;
-
-      readStream.on("data", (chunk) => {
-        const chunkFileName = `${outputPrefix}${String(index).padStart(
-          3,
-          "0"
-        )}${fileExtension}`;
-        fs.writeFileSync(chunkFileName, chunk);
-        index++;
-      });
-
-      readStream.on("end", () => {
-        console.log(
-          `File ${filename} split successfully into ${index} chunks.`
-        );
-        fileModel.markAsProcessed(filename);
-        resolve();
-      });
-
-      readStream.on("error", (error) => {
-        reject(error);
-      });
-    });
-  });
-}
-
-async function verifyChunks(filename) {
-  return new Promise((resolve, reject) => {
-    const outputFileName = path.parse(filename).name; // Get file name without extension
-    const fileExtension = path.extname(filename); // Get file extension
-    const chunkPattern = new RegExp(
-      `^${outputFileName}_\\d{3}\\${fileExtension}$`
-    ); // Matches "file_000.pdf"
-
-    // Find all split chunks
-    const chunkFiles = fs
-      .readdirSync(OUTPUT_FOLDER)
-      .filter((f) => chunkPattern.test(f)) // Filter files matching the pattern
-      .sort(); // Ensure correct order
-
-    if (chunkFiles.length === 0) {
-      return reject(` No chunks found for ${filename}`);
+    if (!fileExists(inputFilePath)) {
+      console.error(`❌ File not found: ${inputFilePath}`);
+      return;
     }
 
+    const pdfBytes = fs.readFileSync(inputFilePath);
+    const pdfDoc = await PDFDocument.load(pdfBytes);
+    const totalPages = pdfDoc.getPageCount();
+
     console.log(
-      ` Found ${chunkFiles.length} chunks for ${filename}:`,
-      chunkFiles
+      `📄 Splitting PDF: ${inputFilePath} (Total Pages: ${totalPages})`
     );
 
-    const inputFilePath = path.join(INPUT_FOLDER, filename);
-    const reconstructedFile = path.join(
-      OUTPUT_FOLDER,
-      `${outputFileName}_reconstructed${fileExtension}`
-    );
-    const writeStream = fs.createWriteStream(reconstructedFile);
+    for (let i = 0; i < totalPages; i += 10) {
+      const newPdf = await PDFDocument.create();
+      const end = Math.min(i + 10, totalPages);
 
-    chunkFiles.forEach((chunk) => {
-      const chunkPath = path.join(OUTPUT_FOLDER, chunk);
-      const data = fs.readFileSync(chunkPath);
-      writeStream.write(data);
-    });
-
-    writeStream.end(() => {
-      // Compare original and reconstructed file hashes
-      const originalHash = getFileHash(inputFilePath);
-      const reconstructedHash = getFileHash(reconstructedFile);
-
-      if (originalHash === reconstructedHash) {
-        console.log(`File ${filename} integrity verified!`);
-        fs.unlinkSync(reconstructedFile); // Remove temp file
-      } else {
-        console.error(`File ${filename} integrity check failed!`);
+      for (let j = i; j < end; j++) {
+        const [copiedPage] = await newPdf.copyPages(pdfDoc, [j]);
+        newPdf.addPage(copiedPage);
       }
-      resolve();
-    });
-  });
+
+      const newPdfBytes = await newPdf.save();
+      const chunkName = `${path.basename(inputFileName, ".pdf")}_part${
+        i / 10 + 1
+      }.pdf`;
+      const chunkPath = path.join(outputFolder, chunkName);
+
+      fs.writeFileSync(chunkPath, newPdfBytes);
+      console.log(`✅ Created chunk: ${chunkPath}`);
+    }
+
+    console.log(`🎉 PDF Splitting Completed!`);
+  } catch (error) {
+    console.error("❌ Error splitting PDF:", error);
+  }
 }
 
-function getFileHash(filePath) {
-  const hash = crypto.createHash("sha256");
-  const fileBuffer = fs.readFileSync(filePath);
-  hash.update(fileBuffer);
-  return hash.digest("hex");
+// ✅ Merge multiple PDF files
+async function mergePDFs(outputFileName, inputFolder) {
+  try {
+    const outputFilePath = path.join(OUTPUT_FOLDER, outputFileName);
+    const mergedPdf = await PDFDocument.create();
+    const files = fs
+      .readdirSync(inputFolder)
+      .filter((file) => file.endsWith(".pdf"))
+      .sort();
+
+    if (files.length === 0) {
+      console.error("❌ No PDF files found in the output folder.");
+      return;
+    }
+
+    for (const file of files) {
+      const filePath = path.join(inputFolder, file);
+      const pdfBytes = fs.readFileSync(filePath);
+      const pdfDoc = await PDFDocument.load(pdfBytes);
+      const pages = await mergedPdf.copyPages(pdfDoc, pdfDoc.getPageIndices());
+
+      pages.forEach((page) => mergedPdf.addPage(page));
+    }
+
+    const mergedPdfBytes = await mergedPdf.save();
+    fs.writeFileSync(outputFilePath, mergedPdfBytes);
+    console.log(`✅ Merged PDF saved as ${outputFilePath}`);
+  } catch (error) {
+    console.error("❌ Error merging PDFs:", error);
+  }
 }
+
+// Example usage
+splitPDF("sample.pdf", OUTPUT_FOLDER);
+mergePDFs("merged.pdf", OUTPUT_FOLDER);
 
 module.exports = {
-  getNewFiles,
-  splitFile,
-  verifyChunks,
+  splitPDF,
+  mergePDFs,
   INPUT_FOLDER,
   OUTPUT_FOLDER,
 };
